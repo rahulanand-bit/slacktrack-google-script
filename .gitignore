@@ -1,0 +1,12 @@
+# Local and secret files
+*.env
+*.env.*
+*.key
+*.pem
+credentials*.txt
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
