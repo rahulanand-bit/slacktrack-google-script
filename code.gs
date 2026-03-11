@@ -402,6 +402,7 @@ function getOrCreateMonthSheet_(dateObj, tz) {
     ss.setActiveSheet(sh);
     ss.moveActiveSheet(ss.getNumSheets());
     clearMonthData_(sh);
+    formatMonthSheetHeader_(sh, dateObj, zone);
     return sh;
   }
 
@@ -418,7 +419,7 @@ function updateAttendanceForDate_(slackUserId, attendanceValue, dateObj, tz) {
   try {
     const sh = getOrCreateMonthSheet_(dateObj, tz);
 
-    const row = findOrCreateUserRow_(sh, slackUserId);
+    const row = findOrCreateUserRow_(sh, slackUserId, dateObj, tz);
     if (!row) return { ok: false, error: `Could not resolve row for Slack user ${slackUserId}` };
 
     const dayNum = Number(Utilities.formatDate(dateObj, tz, "d"));
@@ -489,6 +490,14 @@ function clearMonthData_(sh) {
   });
 }
 
+function refreshCurrentMonthSheetFormat() {
+  const tz = getProp_("TIMEZONE", false) || Session.getScriptTimeZone();
+  const today = new Date();
+  const sh = getOrCreateMonthSheet_(today, tz);
+  rewriteDayHeaders_(sh, today, tz);
+  formatMonthSheetHeader_(sh, today, tz);
+}
+
 function initializeNewMonthSheet_(sh, dateObj, tz) {
   sh.getRange(1, 1).setValue("Employee Name");
   sh.getRange(1, 2).setValue("SlackUserID");
@@ -496,33 +505,126 @@ function initializeNewMonthSheet_(sh, dateObj, tz) {
   sh.getRange(1, 4).setValue("Last Updated at");
   sh.getRange(1, 5).setValue("Client");
 
+  rewriteDayHeaders_(sh, dateObj, tz);
+
+  formatMonthSheetHeader_(sh, dateObj, tz);
+  sh.setFrozenRows(1);
+}
+
+function rewriteDayHeaders_(sh, dateObj, tz) {
   const year = Number(Utilities.formatDate(dateObj, tz, "yyyy"));
   const month = Number(Utilities.formatDate(dateObj, tz, "M")) - 1;
   const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const headerValues = [Array.from({ length: daysInMonth }, (_, index) => {
+    return getDayHeaderLabel_(new Date(year, month, index + 1));
+  })];
 
-  let col = CFG.FIRST_DAY_COL;
+  sh.getRange(CFG.HEADER_ROW, CFG.FIRST_DAY_COL, 1, daysInMonth).setValues(headerValues);
+}
+
+function formatMonthSheetHeader_(sh, dateObj, tz) {
+  const year = Number(Utilities.formatDate(dateObj, tz, "yyyy"));
+  const month = Number(Utilities.formatDate(dateObj, tz, "M")) - 1;
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const lastHeaderCol = CFG.FIRST_DAY_COL + daysInMonth - 1;
+  const headerRange = sh.getRange(CFG.HEADER_ROW, 1, 1, lastHeaderCol);
+
+  headerRange
+    .setBackground("#d9eaf7")
+    .setFontWeight("bold")
+    .setHorizontalAlignment("center")
+    .setVerticalAlignment("middle");
+
+  sh.getRange(CFG.HEADER_ROW, 1, 1, CFG.FIRST_DAY_COL - 1).setWrap(false);
+  sh.getRange(CFG.HEADER_ROW, CFG.FIRST_DAY_COL, 1, daysInMonth).setWrap(true);
+  sh.setRowHeight(CFG.HEADER_ROW, 36);
+
+  getWeekendDayColumns_(dateObj, tz).forEach(col => {
+    sh.getRange(CFG.HEADER_ROW, col).setBackground("#f4cccc");
+  });
+
+  formatWeekendColumnsForUsedRows_(sh, dateObj, tz);
+}
+
+function getWeekendDayColumns_(dateObj, tz) {
+  const year = Number(Utilities.formatDate(dateObj, tz, "yyyy"));
+  const month = Number(Utilities.formatDate(dateObj, tz, "M")) - 1;
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const cols = [];
+
   for (let d = 1; d <= daysInMonth; d++) {
-    sh.getRange(1, col).setValue(d);
-    col++;
+    const weekday = new Date(year, month, d).getDay();
+    if (weekday === 0 || weekday === 6) cols.push(CFG.FIRST_DAY_COL + d - 1);
   }
+  return cols;
+}
 
-  sh.setFrozenRows(1);
+function formatWeekendColumnsForUsedRows_(sh, dateObj, tz) {
+  const lastRow = sh.getLastRow();
+  if (lastRow < CFG.DATA_START_ROW) return;
+
+  const year = Number(Utilities.formatDate(dateObj, tz, "yyyy"));
+  const month = Number(Utilities.formatDate(dateObj, tz, "M")) - 1;
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const rowCount = lastRow - CFG.DATA_START_ROW + 1;
+
+  sh.getRange(CFG.DATA_START_ROW, CFG.FIRST_DAY_COL, rowCount, daysInMonth).setBackground("#ffffff");
+  getWeekendDayColumns_(dateObj, tz).forEach(col => {
+    sh.getRange(CFG.DATA_START_ROW, col, rowCount, 1).setBackground("#f4cccc");
+  });
+}
+
+function formatWeekendColumnsForRow_(sh, row, dateObj, tz) {
+  getWeekendDayColumns_(dateObj, tz).forEach(col => {
+    sh.getRange(row, col).setBackground("#f4cccc");
+  });
+}
+
+function getDayHeaderLabel_(dateObj) {
+  const dayNum = dateObj.getDate();
+  const weekdayMap = ["S", "M", "T", "W", "Th", "F", "S"];
+  return `${dayNum} ${weekdayMap[dateObj.getDay()]}`;
+}
+
+function extractDayNumber_(headerValue) {
+  const s = String(headerValue || "").trim();
+  if (!s) return NaN;
+
+  const direct = Number(s);
+  if (!isNaN(direct)) return direct;
+
+  const match = s.match(/^(\d{1,2})\b/);
+  return match ? Number(match[1]) : NaN;
 }
 
 /* =========================
    Lookup helpers
 ========================= */
 
-function findOrCreateUserRow_(sh, slackUserId) {
+function findOrCreateUserRow_(sh, slackUserId, dateObj, tz) {
   const existing = findRowBySlackId_(sh, slackUserId);
   if (existing) return existing;
 
   const nextRow = Math.max(sh.getLastRow() + 1, CFG.DATA_START_ROW);
-  // fast write to avoid webhook slowness; you can enrich later
-  sh.getRange(nextRow, CFG.NAME_COL).setValue(slackUserId);
+  sh.getRange(nextRow, CFG.NAME_COL).setValue(getUserDisplayName_(slackUserId));
   sh.getRange(nextRow, CFG.SLACK_ID_COL).setValue(slackUserId);
   sh.getRange(nextRow, CFG.EMAIL_COL).setValue("");
+  formatWeekendColumnsForRow_(sh, nextRow, dateObj, tz);
   return nextRow;
+}
+
+function getUserDisplayName_(slackUserId) {
+  const raw = getProp_("USER_MAP_JSON", false);
+  if (!raw) return slackUserId;
+
+  try {
+    const userMap = JSON.parse(raw);
+    const mappedName = userMap && typeof userMap === "object" ? userMap[slackUserId] : "";
+    return String(mappedName || "").trim() || slackUserId;
+  } catch (err) {
+    console.error(`Invalid USER_MAP_JSON: ${err}`);
+    return slackUserId;
+  }
 }
 
 function findRowBySlackId_(sh, slackUserId) {
@@ -544,7 +646,7 @@ function findDayColumn_(sh, dayNum) {
   for (let i = 0; i < dayCols.length; i++) {
     const col = dayCols[i];
     const v = sh.getRange(CFG.HEADER_ROW, col).getValue();
-    if (Number(v) === dayNum || String(v).trim() === String(dayNum)) return col;
+    if (extractDayNumber_(v) === dayNum) return col;
   }
   return 0;
 }
@@ -555,13 +657,8 @@ function getDayColumns_(sh) {
   const cols = [];
 
   for (let c = 1; c <= headers.length; c++) {
-    const raw = headers[c - 1];
-    const n = Number(raw);
-    if (!isNaN(n) && n >= 1 && n <= 31) cols.push(c);
-    else {
-      const s = String(raw || "").trim();
-      if (/^(?:[1-9]|[12]\d|3[01])$/.test(s)) cols.push(c);
-    }
+    const dayNum = extractDayNumber_(headers[c - 1]);
+    if (!isNaN(dayNum) && dayNum >= 1 && dayNum <= 31) cols.push(c);
   }
   return cols;
 }
@@ -706,3 +803,8 @@ function sendEveningReminders() {
     }
   });
 }
+
+
+
+
+
