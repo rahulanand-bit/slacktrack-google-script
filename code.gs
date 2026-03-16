@@ -14,7 +14,10 @@ const CFG = {
   LAST_UPDATED_COL: 4,  // D: Last Updated at
   FIRST_DAY_COL: 6,     // F onward day columns
   CHAT_QUEUE_KEY: "CHAT_EVENT_QUEUE_JSON",
-  CHAT_QUEUE_LIMIT: 200
+  CHAT_QUEUE_LIMIT: 200,
+  ROW_MAP_PROP_PREFIX: "ROW_MAP",
+  ROW_MAP_CACHE_PREFIX: "row",
+  ROW_MAP_CACHE_TTL_SECONDS: 6 * 60 * 60,
 };
 
 /**
@@ -26,6 +29,7 @@ const CFG = {
  */
 function doPost(e) {
   const start = new Date();
+  let interactiveStartMs = 0;
   try {
     const tz = getProp_("TIMEZONE", false) || Session.getScriptTimeZone();
 
@@ -60,6 +64,11 @@ function doPost(e) {
           !ev.subtype
         ) {
           enqueueChatEvent_(ev);
+          try {
+            sendTextDM_(ev.channel, "Got your message. Processing your attendance request.");
+          } catch (ackErr) {
+            console.error("Immediate chat ack failed:", ackErr);
+          }
         }
 
         // ACK quickly to avoid Slack timeout
@@ -70,6 +79,7 @@ function doPost(e) {
     // 2) Interactive payload (buttons)
     const payload = getSlackPayload_(e);
     if (payload) {
+      interactiveStartMs = Date.now();
       const expectedTeamId = getProp_("SLACK_TEAM_ID", false);
       if (expectedTeamId && payload?.team?.id !== expectedTeamId) {
         return jsonOut_({ ok: false, error: "Team mismatch" });
@@ -95,6 +105,9 @@ function doPost(e) {
       const result = updateTodayAttendance_(userId, attendanceValue, tz);
 
       if (!result.ok) {
+        console.log(
+          `Interactive timings total=${Date.now() - interactiveStartMs}ms row-resolution=${result.rowResolutionMs || 0}ms write=${result.writeMs || 0}ms fallback-rebuild=${result.fallbackRebuildMs || 0}ms`
+        );
         console.error("Update failed:", JSON.stringify(result));
         return jsonOut_({
           response_type: "ephemeral",
@@ -102,6 +115,9 @@ function doPost(e) {
         });
       }
 
+      console.log(
+        `Interactive timings total=${Date.now() - interactiveStartMs}ms row-resolution=${result.rowResolutionMs || 0}ms write=${result.writeMs || 0}ms fallback-rebuild=${result.fallbackRebuildMs || 0}ms`
+      );
       console.log(`Updated ${userId} -> ${attendanceValue} in ${new Date() - start}ms`);
       return jsonOut_({
         response_type: "ephemeral",
@@ -296,7 +312,7 @@ User text:
 """${text}"""
 `;
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
   const payload = {
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: { temperature: 0.1, maxOutputTokens: 400 }
@@ -390,7 +406,7 @@ function formatDateYmd_(d, tz) {
 function getOrCreateMonthSheet_(dateObj, tz) {
   const ss = SpreadsheetApp.openById(getProp_("SPREADSHEET_ID"));
   const zone = tz || getProp_("TIMEZONE", false) || Session.getScriptTimeZone();
-  const targetName = Utilities.formatDate(dateObj, zone, "MMMM yyyy");
+  const targetName = getMonthSheetName_(dateObj, zone);
 
   let sh = ss.getSheetByName(targetName);
   if (sh) return sh;
@@ -411,24 +427,95 @@ function getOrCreateMonthSheet_(dateObj, tz) {
   return sh;
 }
 
+function getCurrentMonthSheet_(dateObj, tz) {
+  const ss = SpreadsheetApp.openById(getProp_("SPREADSHEET_ID"));
+  const zone = tz || getProp_("TIMEZONE", false) || Session.getScriptTimeZone();
+  const targetName = getMonthSheetName_(dateObj, zone);
+  return ss.getSheetByName(targetName);
+}
+
+function getMonthSheetName_(dateObj, tz) {
+  return Utilities.formatDate(dateObj, tz, "MMMM yyyy");
+}
+
+function prepareCurrentAndNextMonthSheets() {
+  const tz = getProp_("TIMEZONE", false) || Session.getScriptTimeZone();
+  const today = new Date();
+  getOrCreateMonthSheet_(today, tz);
+  getOrCreateMonthSheet_(new Date(today.getFullYear(), today.getMonth() + 1, 1), tz);
+}
+
+function prepareNextMonthSheet() {
+  const tz = getProp_("TIMEZONE", false) || Session.getScriptTimeZone();
+  const today = new Date();
+  getOrCreateMonthSheet_(new Date(today.getFullYear(), today.getMonth() + 1, 1), tz);
+}
+
 function updateTodayAttendance_(slackUserId, attendanceValue, tz) {
-  return updateAttendanceForDate_(slackUserId, attendanceValue, new Date(), tz);
+  return updateAttendanceForDateFast_(slackUserId, attendanceValue, new Date(), tz);
+}
+
+function updateAttendanceForDateFast_(slackUserId, attendanceValue, dateObj, tz) {
+  try {
+    const sh = getCurrentMonthSheet_(dateObj, tz);
+    if (!sh) {
+      return { ok: false, error: "Month sheet not ready yet. Please retry." };
+    }
+
+    const rowStartMs = Date.now();
+    const rowResult = resolveUserRowForWrite_(sh, slackUserId, dateObj, tz);
+    const rowResolutionMs = Date.now() - rowStartMs;
+
+    const row = rowResult.row;
+    if (!row) return { ok: false, error: `Could not resolve row for Slack user ${slackUserId}` };
+
+    const dayNum = Number(Utilities.formatDate(dateObj, tz, "d"));
+    const col = CFG.FIRST_DAY_COL + dayNum - 1;
+    if (col < CFG.FIRST_DAY_COL || col > sh.getLastColumn()) {
+      return { ok: false, error: `Day column not found for day ${dayNum}` };
+    }
+
+    const writeStartMs = Date.now();
+    sh.getRange(row, col).setValue(attendanceValue);
+    sh.getRange(row, CFG.LAST_UPDATED_COL).setValue(new Date());
+    const writeMs = Date.now() - writeStartMs;
+    return {
+      ok: true,
+      rowResolutionMs,
+      writeMs,
+      fallbackRebuildMs: rowResult.fallbackRebuildMs || 0
+    };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
 }
 
 function updateAttendanceForDate_(slackUserId, attendanceValue, dateObj, tz) {
   try {
     const sh = getOrCreateMonthSheet_(dateObj, tz);
+    const rowStartMs = Date.now();
+    const rowResult = resolveUserRowForWrite_(sh, slackUserId, dateObj, tz);
+    const rowResolutionMs = Date.now() - rowStartMs;
 
-    const row = findOrCreateUserRow_(sh, slackUserId, dateObj, tz);
+    const row = rowResult.row;
     if (!row) return { ok: false, error: `Could not resolve row for Slack user ${slackUserId}` };
 
     const dayNum = Number(Utilities.formatDate(dateObj, tz, "d"));
-    const col = findDayColumn_(sh, dayNum);
-    if (!col) return { ok: false, error: `Day column not found for day ${dayNum}` };
+    const col = CFG.FIRST_DAY_COL + dayNum - 1;
+    if (col < CFG.FIRST_DAY_COL || col > sh.getLastColumn()) {
+      return { ok: false, error: `Day column not found for day ${dayNum}` };
+    }
 
+    const writeStartMs = Date.now();
     sh.getRange(row, col).setValue(attendanceValue);
     sh.getRange(row, CFG.LAST_UPDATED_COL).setValue(new Date());
-    return { ok: true };
+    const writeMs = Date.now() - writeStartMs;
+    return {
+      ok: true,
+      rowResolutionMs,
+      writeMs,
+      fallbackRebuildMs: rowResult.fallbackRebuildMs || 0
+    };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
@@ -436,11 +523,11 @@ function updateAttendanceForDate_(slackUserId, attendanceValue, dateObj, tz) {
 
 function getStatusForDate_(slackUserId, dateObj, tz) {
   const sh = getOrCreateMonthSheet_(dateObj, tz);
-  const row = findRowBySlackId_(sh, slackUserId);
+  const row = resolveUserRowForRead_(sh, slackUserId);
   if (!row) return "";
   const dayNum = Number(Utilities.formatDate(dateObj, tz, "d"));
-  const col = findDayColumn_(sh, dayNum);
-  if (!col) return "";
+  const col = CFG.FIRST_DAY_COL + dayNum - 1;
+  if (col < CFG.FIRST_DAY_COL || col > sh.getLastColumn()) return "";
   return String(sh.getRange(row, col).getValue() || "").trim();
 }
 
@@ -602,15 +689,138 @@ function extractDayNumber_(headerValue) {
 ========================= */
 
 function findOrCreateUserRow_(sh, slackUserId, dateObj, tz) {
+  const sheetName = sh.getName();
+  const mapped = getMappedRowForUser_(sheetName, slackUserId);
+  if (isMappedRowValid_(sh, mapped, slackUserId)) return mapped;
+
   const existing = findRowBySlackId_(sh, slackUserId);
-  if (existing) return existing;
+  if (existing) {
+    setMappedRowForUser_(sheetName, slackUserId, existing);
+    return existing;
+  }
 
   const nextRow = Math.max(sh.getLastRow() + 1, CFG.DATA_START_ROW);
   sh.getRange(nextRow, CFG.NAME_COL).setValue(getUserDisplayName_(slackUserId));
   sh.getRange(nextRow, CFG.SLACK_ID_COL).setValue(slackUserId);
   sh.getRange(nextRow, CFG.EMAIL_COL).setValue("");
   formatWeekendColumnsForRow_(sh, nextRow, dateObj, tz);
+  setMappedRowForUser_(sheetName, slackUserId, nextRow);
   return nextRow;
+}
+
+function resolveUserRowForWrite_(sh, slackUserId, dateObj, tz) {
+  const sheetName = sh.getName();
+  const mapped = getMappedRowForUser_(sheetName, slackUserId);
+  if (isMappedRowValid_(sh, mapped, slackUserId)) {
+    return { row: mapped, fallbackRebuildMs: 0 };
+  }
+
+  const fallbackStartMs = Date.now();
+  let row = findRowBySlackId_(sh, slackUserId);
+  if (!row) {
+    row = createUserRow_(sh, slackUserId, dateObj, tz);
+  }
+
+  if (row) {
+    setMappedRowForUser_(sheetName, slackUserId, row);
+  }
+
+  return {
+    row,
+    fallbackRebuildMs: Date.now() - fallbackStartMs
+  };
+}
+
+function resolveUserRowForRead_(sh, slackUserId) {
+  const sheetName = sh.getName();
+  const mapped = getMappedRowForUser_(sheetName, slackUserId);
+  if (isMappedRowValid_(sh, mapped, slackUserId)) return mapped;
+
+  const row = findRowBySlackId_(sh, slackUserId);
+  if (row) setMappedRowForUser_(sheetName, slackUserId, row);
+  return row;
+}
+
+function createUserRow_(sh, slackUserId, dateObj, tz) {
+  const nextRow = Math.max(sh.getLastRow() + 1, CFG.DATA_START_ROW);
+  sh.getRange(nextRow, CFG.NAME_COL).setValue(getUserDisplayName_(slackUserId));
+  sh.getRange(nextRow, CFG.SLACK_ID_COL).setValue(slackUserId);
+  sh.getRange(nextRow, CFG.EMAIL_COL).setValue("");
+  formatWeekendColumnsForRow_(sh, nextRow, dateObj, tz);
+  return nextRow;
+}
+
+function isMappedRowValid_(sh, row, slackUserId) {
+  if (!row || row < CFG.DATA_START_ROW) return false;
+  const value = String(sh.getRange(row, CFG.SLACK_ID_COL).getValue() || "").trim();
+  return value === slackUserId;
+}
+
+function getMappedRowForUser_(sheetName, slackUserId) {
+  const cachedRow = getUserRowFromCache_(sheetName, slackUserId);
+  if (cachedRow) return cachedRow;
+
+  const propMap = getMonthRowMapFromProperties_(sheetName);
+  const propRow = Number(propMap && propMap[slackUserId]);
+  if (propRow) {
+    putUserRowInCache_(sheetName, slackUserId, propRow);
+    return propRow;
+  }
+
+  return 0;
+}
+
+function setMappedRowForUser_(sheetName, slackUserId, row) {
+  if (!row || row < CFG.DATA_START_ROW) return;
+
+  const propMap = getMonthRowMapFromProperties_(sheetName);
+  propMap[slackUserId] = row;
+  saveMonthRowMapToProperties_(sheetName, propMap);
+  putUserRowInCache_(sheetName, slackUserId, row);
+}
+
+function getMonthRowMapFromProperties_(sheetName) {
+  const key = getMonthRowMapPropertyKey_(sheetName);
+  const raw = PropertiesService.getScriptProperties().getProperty(key);
+  if (!raw) return {};
+
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (err) {
+    console.error(`Invalid row map in Script Properties for ${sheetName}: ${err}`);
+    return {};
+  }
+}
+
+function saveMonthRowMapToProperties_(sheetName, mapObj) {
+  const key = getMonthRowMapPropertyKey_(sheetName);
+  PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(mapObj || {}));
+}
+
+function getUserRowFromCache_(sheetName, slackUserId) {
+  const key = getUserRowCacheKey_(sheetName, slackUserId);
+  const raw = CacheService.getScriptCache().get(key);
+  const row = Number(raw);
+  return row || 0;
+}
+
+function putUserRowInCache_(sheetName, slackUserId, row) {
+  if (!row || row < CFG.DATA_START_ROW) return;
+  const key = getUserRowCacheKey_(sheetName, slackUserId);
+  CacheService.getScriptCache().put(
+    key,
+    String(row),
+    Math.min(CFG.ROW_MAP_CACHE_TTL_SECONDS, 21600)
+  );
+}
+
+function getMonthRowMapPropertyKey_(sheetName) {
+  return `${CFG.ROW_MAP_PROP_PREFIX}:${encodeURIComponent(sheetName)}`;
+}
+
+function getUserRowCacheKey_(sheetName, slackUserId) {
+  return `${CFG.ROW_MAP_CACHE_PREFIX}:${encodeURIComponent(sheetName)}:${encodeURIComponent(slackUserId)}`;
 }
 
 function getUserDisplayName_(slackUserId) {
@@ -712,6 +922,14 @@ function slackApi_(method, body) {
   return json;
 }
 
+function notifyAttendanceFailure_(userId, attendanceValue, dateYmd, errorText) {
+  const channelId = openIm_(userId);
+  if (!channelId) return;
+
+  const dateLabel = dateYmd || "the requested date";
+  sendTextDM_(channelId, `I couldn't update *${attendanceValue || "attendance"}* for ${dateLabel}. Please try again. Error: ${errorText}`);
+}
+
 /* =========================
    Utility
 ========================= */
@@ -761,19 +979,48 @@ function getReminderUserIds_() {
 }
 
 function hasTodayAttendance_(sh, slackUserId, tz) {
-  const row = findRowBySlackId_(sh, slackUserId);
+  const row = resolveUserRowForRead_(sh, slackUserId);
   if (!row) return false;
 
   const dayNum = Number(Utilities.formatDate(new Date(), tz, "d"));
-  const dayCol = findDayColumn_(sh, dayNum);
-  if (!dayCol) return false;
+  const dayCol = CFG.FIRST_DAY_COL + dayNum - 1;
+  if (dayCol < CFG.FIRST_DAY_COL || dayCol > sh.getLastColumn()) return false;
 
   const val = String(sh.getRange(row, dayCol).getValue() || "").trim();
   return val !== "";
 }
 
 function sendMorningReminders() {
+  const tz = getProp_("TIMEZONE", false) || Session.getScriptTimeZone();
+  const today = new Date();
+  prepareCurrentAndNextMonthSheets();
+
+  const sh = getOrCreateMonthSheet_(today, tz);
+  const sheetName = sh.getName();
+  const monthMap = getMonthRowMapFromProperties_(sheetName);
   const userIds = getReminderUserIds_();
+
+  userIds.forEach(userId => {
+    try {
+      let row = Number(monthMap[userId]);
+      if (!isMappedRowValid_(sh, row, userId)) {
+        row = findRowBySlackId_(sh, userId);
+      }
+      if (!row) {
+        row = createUserRow_(sh, userId, today, tz);
+      }
+      if (row) monthMap[userId] = row;
+    } catch (err) {
+      console.error(`Morning row prep failed for ${userId}: ${err}`);
+    }
+  });
+
+  saveMonthRowMapToProperties_(sheetName, monthMap);
+  userIds.forEach(userId => {
+    const row = Number(monthMap[userId]);
+    if (row) putUserRowInCache_(sheetName, userId, row);
+  });
+
   userIds.forEach(userId => {
     try {
       sendAttendanceButtonsDM_(userId);
@@ -803,6 +1050,12 @@ function sendEveningReminders() {
     }
   });
 }
+
+
+
+
+
+
 
 
 
