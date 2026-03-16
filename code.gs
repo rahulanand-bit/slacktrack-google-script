@@ -18,6 +18,18 @@ const CFG = {
   ROW_MAP_PROP_PREFIX: "ROW_MAP",
   ROW_MAP_CACHE_PREFIX: "row",
   ROW_MAP_CACHE_TTL_SECONDS: 6 * 60 * 60,
+  HOLIDAY_YMD: [
+    "2026-01-01",
+    "2026-01-26",
+    "2026-03-04",
+    "2026-03-19",
+    "2026-04-03",
+    "2026-09-14",
+    "2026-10-02",
+    "2026-10-20",
+    "2026-11-09",
+    "2026-12-25"
+  ],
 };
 
 /**
@@ -978,6 +990,13 @@ function getReminderUserIds_() {
     .filter(Boolean);
 }
 
+function shouldSkipRemindersToday_(dateObj, tz) {
+  const day = dateObj.getDay();
+  if (day === 0 || day === 6) return true;
+  const ymd = formatDateYmd_(dateObj, tz);
+  return CFG.HOLIDAY_YMD.includes(ymd);
+}
+
 function hasTodayAttendance_(sh, slackUserId, tz) {
   const row = resolveUserRowForRead_(sh, slackUserId);
   if (!row) return false;
@@ -993,6 +1012,10 @@ function hasTodayAttendance_(sh, slackUserId, tz) {
 function sendMorningReminders() {
   const tz = getProp_("TIMEZONE", false) || Session.getScriptTimeZone();
   const today = new Date();
+  if (shouldSkipRemindersToday_(today, tz)) {
+    console.log(`Morning reminders skipped for non-working day: ${formatDateYmd_(today, tz)}`);
+    return;
+  }
   prepareCurrentAndNextMonthSheets();
 
   const sh = getOrCreateMonthSheet_(today, tz);
@@ -1033,7 +1056,12 @@ function sendMorningReminders() {
 
 function sendEveningReminders() {
   const tz = getProp_("TIMEZONE", false) || Session.getScriptTimeZone();
-  const sh = getOrCreateMonthSheet_(new Date(), tz);
+  const today = new Date();
+  if (shouldSkipRemindersToday_(today, tz)) {
+    console.log(`Evening reminders skipped for non-working day: ${formatDateYmd_(today, tz)}`);
+    return;
+  }
+  const sh = getOrCreateMonthSheet_(today, tz);
   const userIds = getReminderUserIds_();
 
   userIds.forEach(userId => {
